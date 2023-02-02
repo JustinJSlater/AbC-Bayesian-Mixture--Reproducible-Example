@@ -1,0 +1,538 @@
+---
+title: "A Bayesian Approach to Estimating COVID-19 Incidence and Infection Fatality Rates: Reproducible Example"
+author: 
+- Justin Slater 
+- Aiyush Bansal
+- Harlan Campbell
+- Jeffrey S. Rosenthal
+- Paul Gustafson
+- Patrick E. Brown
+date: '2022-10-24'
+output: bookdown::pdf_document2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE}
+library(dplyr)
+library(ggdist)
+library(ggplot2)
+library(rstan)
+library(knitr)
+library(bookdown)
+library(kableExtra)
+
+expit <- function(x){exp(x)/(1+exp(x))}
+```
+
+# Introduction
+
+The serosurvey data used in the main paper is highly confidential and thus cannot be shared publicly. We therefore created this reproducible example using simulated serosurvey data in combination with real census data in order to demonstrate how our method is implemented. We have tried to keep this example as simple as possible, while still retaining the key aspects and novelty of our method. The following simplifications have been made:
+
+1. Instead of using age/sex/ethnicity/education/province as covariates, we are just using age. This lightens the code substantially and will allow us to demonstrate our method without unnecessary details. When poststratifying and computing IFR, we will treat Canada as one region.
+2. We are only simulating two titre values instead of three. Since the SmT1 and RBD titre values in Phase 2 tell us generally the same thing, we are going to only simulate NP and SmT1 titre values here. We can use the combination of the two to distinguish between vaccinated and infected individuals.
+
+In this document, we will simulate serosurvey data, with titre values similar to those in our paper. We will replicate the analysis of the Phase 2 data, as this is the most challenging to implement. We present our model setup and stan code for fitting multivariate mixture models to serosurvey titre values, and poststratifying the results. We then demonstrate how we used results from these mixture models, along with disaggregated deaths data in order to estimate Infection Fatality rates in the Canadian population residing outside of long-term care (LTC). 
+
+# Data simulation
+
+We start by simulating serosurvey data where N = 7300, 25% of which are <40 years old, 35% are 40-59 years old, 25% are 60-69 years old, and 15% are 70+ years old. We choose the <40 group to be the reference group, and specify ~12% incidence in this category ($\beta_0 = -1.992$ in the model below). We then make the theoretical incidence in the 40-59 group ~10% ($\beta_1 = -.2$), ~8.4% in the 60-69 year old group ($\beta_2=-.4$), and ~ 7% in the 70+ group ($\beta_3 = -.6$).
+
+We compute infection probabilities, $p_i$, for each person $i=1...N$ in the cohort via:
+$$ \text{logit}(p_i) = \beta_0 + \beta_1 \cdot \boldsymbol{1}\{\text{age(i)} \in [40-59]\} + \beta_2 \cdot \boldsymbol{1}\{\text{age(i)} \in [60-69]\} +\beta_3 \cdot \boldsymbol{1}\{\text{age(i)} \geq 70]\}$$
+where $\boldsymbol{1}$ is the indicator function. Next, we simulate previous infection status, $Z_i$, for each person via $$Z_i = \text{Bern}(p_i)$$
+The incidence in our cohort is shown in Table \@ref(tab:datasim). Since this is not a formal simulation study (as this model takes many hours to run), we will take these values as the "true" values of incidence in our simulated serosurvey.
+
+```{r, echo = FALSE}
+# Sample size similar to that of paper.
+N <- 7300
+
+# simulate age distribution
+age_category <- c(rep("<40", N*0.25), 
+                  rep("40-59", N*0.35),
+                  rep("60-69", N*0.25),
+                  rep("70+", N*0.15))
+
+X <- model.matrix(~age_category)
+
+# Beta's correspond to 12% incidence in the <40 group, and slightly lower incidences with increasing age.
+beta <-  matrix(c(-1.992, -0.2, -0.4, -0.6), nrow = 4, ncol = 1)
+
+probs = expit(X%*%beta)
+
+# based on probabilities above, simulate infection status (0, 1) for each participant.
+set.seed(31499)
+prev_infection = rbinom(length(probs),1,probs)
+
+# ipd =individual participant data
+ipd <- cbind.data.frame(age_category=age_category, prev_infection = prev_infection)
+
+overall_true_infections = cbind.data.frame(Age = "Overall", Incidence = round(100*mean(ipd$prev_infection),2))
+
+#true number of infections 
+byage_true_infections = table(ipd$age_category, ipd$prev_infection) %>% prop.table(margin= 1) %>% .[,2] %>% 
+  cbind.data.frame(Age = c("<40", "40-59","60-69","70+")) %>% 
+  mutate(Incidence = round(.*100,1)) %>% 
+  select(Age,Incidence)
+```
+
+```{r, datasim, echo = FALSE}
+rbind.data.frame(overall_true_infections, byage_true_infections) %>% 
+  kable(row.names = FALSE, caption = "Incidence overall and by age in simulated serosurvey data") %>% 
+  kable_styling(position = "center")
+```
+
+We then assume $\rho = \text{prob}(\text{vaccinated}|Z_i=0) = 2\%$, and assume nobody was both vaccinated and infected. 
+
+We then simulate logged titre values $w$ for each person based on values we found in our paper. We assume shifted and scaled t-distributions, t(df, mean, standard deviation), for each of the titres depending on infection status. We assume $w_{np} \sim t(5, -1.5, 0.1)$ for the uninfected and vaccinated groups, and $w_{np} \sim t(30, -0.5, 0.7)$ for the infected group. Recall that vaccination should have no effect on NP titre values. We assumed $w_{SmT1} \sim t(5, -2, 0.08)$ for the uninfected group, $t(30, -0.5, 1)$ for the infected group, and $t(1, 5, 0.5, 0.05)$ for the vaccinated group. This simulation implies that the NP and SmT1 titre values are independent given infection status. 
+
+
+```{r, include = FALSE}
+# simulate vaccination status. Assume 2% of non-infected people were vaccinated
+vaccinated_percentage <- 0.02
+
+ipd$vaccination <- NA
+
+for (i in 1:nrow(ipd)){
+  if(ipd$prev_infection[i]==1){ipd$vaccination[i] =0}
+  else{ipd$vaccination[i] = rbinom(1, 1, vaccinated_percentage)}
+}
+
+#simulate log titre values
+ipd$np_titres <-  NA
+ipd$smt1_titres <-  NA
+
+for (i in 1:nrow(ipd)){
+  if(ipd$prev_infection[i] == 1 ){
+    ipd$np_titres[i] = rstudent_t(1, 30, -0.5, 0.7)
+    ipd$smt1_titres[i] = rstudent_t(1, 30, -0.5, 1)
+  } else if (ipd$vaccination[i] == 1){
+    ipd$np_titres[i] = rstudent_t(1, 5, -1.5, 0.15)
+    ipd$smt1_titres[i] = rstudent_t(1, 5, 0.5, 0.05)
+  } else {
+    ipd$np_titres[i] = rstudent_t(1, 5, -1.5, 0.1)
+    ipd$smt1_titres[i] = rstudent_t(1, 5, -2, 0.08)
+  }
+}
+
+```
+
+```{r, titres,echo = FALSE, fig.cap = "Simulated titre values by infection status. The bottom right cluster of red points corresponds to vaccinated individuals"}
+ipd %>% ggplot(aes(x=smt1_titres, y=np_titres, col = factor(prev_infection)))+
+  geom_point() +
+  theme_bw()+
+  labs(y = "NP", x="SmT1", col = "Infection")
+```
+
+```{r, include = FALSE}
+# number of non-long-term-care residents in each age group from 2016 Canadian census (excludes 0-14 year olds)
+census_age_pops <- cbind.data.frame(pop=c(11033989, 9776943, 6141313, 3208342),
+                                    age_cat = c("<40","40-59","60-69","70+"))
+
+# make a covariate matrix for poststratification
+x_poststrat <- model.matrix(~age_cat, data=census_age_pops)
+```
+
+# Module 1: Estimating the number of infections in Canada
+Estimating the number of infections in Canada is done in two parts. First, we estimate infection probabilities of survey participants based on their age and titre values using a mixture model. Second, since the age distribution of Canada is different than that of the serosurvey, we use poststratification to estimate the number of infections in the Canadian population.
+
+## Mixture modeling of serosurvey data
+
+We now fit our 2-titre, 3-component mixture model to the simulated titre values, assuming we don't know their true infection status. In doing so, we estimate infection probabilities for each survey participant, and use these probabilities to estimate cumulative incidence in Canada via poststratification.
+
+As noted in the paper, we require informative prior information to separate the mixture components, otherwise MCMC is very challenging. In this example, we put a fairly narrow prior centered at 0 for the infected group, intentionally "mis-specifying" this informative prior. Even though this prior has ~99.3% of its mass above the true value, we can recover the true mean titre values in the infected groups of -0.5 reliably (see Table \@ref(tab:parameterCompare)). Furthermore, we can see from Table \ref{tab:seroInfections} that we can recover the true number of infections in the serosurvey data both overall and by age.
+
+```{stan, output.var = "stan_model", include = FALSE}
+data{ 
+  int N; //number of survey participants
+  int K; //number of beta's
+  int n_titres; //number of titres. 2 in this example (3 in the paper) 
+  int n_mix; //number of latent groups (3 in our case)
+  
+  matrix[N,K] x; //model matrix
+  vector[n_titres] w[N]; //log titre values
+  
+  //data for poststratification
+  int<lower=0> M; //number of age categories
+  matrix[M,K] x_ps; // dummy matrix for post-stratification
+  int<lower=0> n_census[M]; //number of Canadians in each age category (from 2016 census)
+}
+
+parameters {
+  real logNu[n_mix]; //df of multivariate t
+  ordered[2] mu_np;
+  ordered[3] mu_smt1;
+  real<lower=0,upper=1> rho; //rho in paper
+  
+  corr_matrix[n_titres] Omega[n_mix]; //prior correlation
+  vector<lower = 0>[n_titres] tau[n_mix]; //prior scale
+  
+  vector[K] beta; //regression coefficients
+}
+
+transformed parameters{
+  cov_matrix[2] sigma[n_mix];
+  real<lower = 0> nu[n_mix];
+  
+  for (k in 1:n_mix){
+    sigma[k,,]=quad_form_diag(Omega[k,,], tau[k]);
+  }
+  nu=exp(logNu);
+}
+
+model {
+  
+  //mixture model
+  real ps[n_mix]; 
+  
+  for (i in 1:N){
+      ps[1] = log1m(rho) + log1m(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[1], [mu_np[1], mu_smt1[1]], quad_form_diag(Omega[1,,], tau[1]));
+      ps[2] = log(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[2], [mu_np[2], mu_smt1[2]], quad_form_diag(Omega[2,,], tau[2]));
+      ps[3] = log(rho) + log1m(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[3], [mu_np[1], mu_smt1[3]], quad_form_diag(Omega[3,,], tau[3]));
+
+    target+= log_sum_exp(ps);
+  }
+
+  //informative priors on mixture components, intentionally misspecified.
+  mu_np[1] ~ normal(-1.75, 0.25); //not infected, not vaccinated, np titre
+  mu_smt1[1] ~ normal(-1.8, 0.2); //not infected, not vaccinated, smt1 titre
+  mu_np[2] ~ normal(0, 0.2); //infected, np titre
+  mu_smt1[2] ~ normal(0, 0.2); //infected, smt1 titre
+  mu_smt1[3] ~ normal( 0.6, 0.2); //not infected, vaccinated, smt1 titre
+
+  rho ~ normal(0.015, 0.0025);
+  
+  //weakly informative priors for correlation matrix
+  for (i in 1:n_mix){
+    tau[1,] ~ cauchy(0,1);
+    Omega[i,,] ~ lkj_corr(0.5);
+  }
+  
+  beta ~ normal(0, 1); //weakly informative prior on the regression coefficients
+  logNu~normal(0,2);
+}
+
+generated quantities{
+  real<upper =0> logCondProb[N]; 
+  real denominator[n_mix];
+  real <lower = 0, upper=1> p_ps[M];
+  int <lower= 0> infections[M]; 
+
+  for (m in 1:M){
+    p_ps[m] = inv_logit(x_ps[m,]*beta);
+    infections[m] = binomial_rng(n_census[m], p_ps[m]);
+  }
+
+  for (i in 1:N){
+      denominator[1] = log1m(rho) + log1m(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[1], [mu_np[1],  mu_smt1[1]], quad_form_diag(Omega[1,,], tau[1]));
+      denominator[2] = log(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[2], [mu_np[2], mu_smt1[2]], quad_form_diag(Omega[2,,], tau[2]));
+      denominator[3] = log(rho) + log1m(inv_logit(x[i,]*beta)) +
+      multi_student_t_lpdf(w[i,]| nu[3], [mu_np[1], mu_smt1[3]], quad_form_diag(Omega[3,,], tau[3]));
+
+    logCondProb[i] = denominator[2] - log_sum_exp(denominator);
+  }
+}
+
+```
+
+
+```{r, include = FALSE}
+
+example_stan_data <- list(N=nrow(ipd),
+                     K=ncol(X),
+                     n_titres=2,
+                     n_mix =3,
+                     x=X,
+                     w=cbind(ipd$np_titres, ipd$smt1_titres),
+                     M=nrow(census_age_pops),
+                     x_ps = x_poststrat,
+                     n_census = census_age_pops$pop)
+
+example_samples <- sampling(stan_model,
+                            data=example_stan_data,
+                            iter = 1000,
+                            warmup=500,
+                            cores = 4,
+                            seed = 14174178)
+
+save(example_samples, file = "example_samples.RData")
+```
+
+
+```{r, infectionprobabilities, echo  = FALSE, fig.cap = "Posterior mean infection probabilies from mixture model for each simulated serosurvey participant."}
+
+#load("example_samples.RData")
+
+probabilities <- rstan::extract(example_samples)$logCondProb %>% exp() %>% colMeans()
+
+cbind.data.frame(ipd, probs = probabilities) %>% 
+  ggplot(aes(y=np_titres, x=smt1_titres, col = probs))+
+  geom_point()+
+  labs(y= "NP",x="SmT1",  col = "Probability\nInfected")+
+  theme_bw()+
+  scale_color_gradient(low="blue", high="red", breaks = c(0.1,0.5,0.9),labels = c(0.1,0.5,0.9))
+
+```
+
+```{r, parameterCompare, echo = FALSE}
+summary(example_samples)$summary[4:9,c(4,6,8)] %>% data.frame() %>% 
+  cbind.data.frame(True = c(-1.5,-0.5,-2,-0.5,0.5, 0.02)) %>% 
+  data.frame() %>% round(3) %>% 
+  mutate(Estimate = paste0(X50., " (", X2.5., ", ", X97.5.,")" ) ) %>% 
+  select(True, Estimate) %>% 
+  kable(row.names = TRUE, caption = "Comparing estimated parameters to true parameters.") %>% 
+  kable_styling(position = "center")
+```
+
+
+```{r, echo = FALSE}
+probs <- rstan::extract(example_samples)$logCondProb %>% exp()
+
+sim_infections <- matrix(nrow= nrow(probs), ncol = ncol(probs))
+
+for (i in 1:ncol(probs)) sim_infections[,i] = rbinom(n = nrow(sim_infections), size = 1, prob = probs[,i])
+  
+
+estimated_survey_infections <- sim_infections %>% 
+  rowSums() %>% 
+  quantile(probs = c(0.025,.500,0.975)) %>% 
+  t() %>% 
+  data.frame() %>% 
+  round(1) %>% 
+  mutate(Infections = paste0(X50., " (",X2.5., ", ", X97.5., ")")) %>% 
+  select(Infections)
+
+estimated_survey_infections_age <- sim_infections %>% 
+  t() %>%  
+  cbind.data.frame(age_category = ipd$age_category) %>% 
+  group_by(age_category) %>% 
+  summarise_all(sum) %>% 
+  select(-age_category) %>% 
+  apply(FUN = quantile, MARGIN = 1, probs =c(0.025,0.5,0.975)) %>% 
+  t() %>% 
+  data.frame() %>% 
+  round(1) %>% 
+  mutate(Infections = paste0(X50., " (",X2.5., ", ", X97.5., ")")) %>% 
+  select(Infections)
+```
+
+```{r, seroInfections, echo = FALSE}
+cbind.data.frame(Age = c("Overall", "<40", "50-59", "60-69", "70+"),
+                rbind.data.frame(estimated_survey_infections, estimated_survey_infections_age),
+                True = c(sum(ipd$prev_infection), table(ipd$age_category,ipd$prev_infection)[,2] )
+                ) %>% 
+  kable(row.names = FALSE, caption = "Estimated vs. True number of infections in Serosurvey data") %>% 
+  kable_styling(position = "center")
+```
+
+
+## Poststratification
+
+The census data has a different age distribution than our simulated serosurvey data, and hence we need to account for this if we want to estimate incidence in Canada.
+
+For each posterior sample, $t$, of $p_j$, the number of infections, $Y^{(t)}_j$, in age group $j$ is sampled via 
+$$Y^{(t)}_j \sim \text{Bin}(n_j, p^{(t)}_j)$$
+where $p_j$ is the probability that a person in age group $j$ is infected, and $n_j$ is the number of (non-long-term care) people in age category $j$ (this is fixed, and comes from the Census data). Note that in the Canadian population, we don't know a person's titre values (they are "integrated out"), so all we have to predict their infection status is there observed covariates (in this case, age).
+
+As in our paper, the cumulative incidence $I^{(t)}_j$, is then estimated as
+$$I_j^{(t)}=\frac{Y^{(t)}_j}{n_j}$$
+for each age group $j$. We can estimate the overall incidence by aggregating posterior samples by group using $$I_\bullet^{(t)} = \frac{\sum_jY_j^{(t)}}{\sum_jn_j}$$
+
+The overall incidence, and incidence by age are shown Table \ref{tab:final}
+
+# Module 2: Infection Fatality Rates estimation
+
+In this section, we estimate the infection fatality rates as described in Section 2.4 of the paper. The reason this is challenging is because we only know aggregated numbers of deaths outside of long-term care (LTC), not the deaths by age. This is because our long-term care deaths are not reported by age/sex, and they are a large proportion of the deaths. We do have the total COVID-19 deaths by age, but not the total deaths by age outside of long-term care.
+
+In our paper, we know the deaths by province, but not by age/sex. Here, we know there are 14805 COVID-19 deaths in long-term care, and we have the number of COVID-19 deaths by age, and need to estimate the number of deaths by age outside long-term care, accounting for uncertainty in the age distribution.
+
+We do this by treating the number of infections, estimated from Module 1, as data $\textit{for each posterior sample}$ ($Y^{(t)}_j = y^{(t)}_j$). $j$ is the age category, a subscript of 1 indicates "outside of long-term care", and  2 indicates "within long-term care".
+For each posterior sample, $t$, of infections from Module 1, $y^{(t)}_j$, we fit the following model:
+\begin{align*}
+  d_{j} &\sim \text{Pois}(\lambda_{1j} + \lambda_{2j})\\
+  d_{2}& \sim \text{Pois} \big(\sum_j \lambda_{2j} \big) \\
+  \lambda_{1j} &= y^{(t)}_j\eta_j\\
+  \lambda_{2j} &= n_{2j} \theta_j
+\end{align*}
+where 
+
+* $d_j$ is the number of COVID-19 deaths in age group $j$ (LTC + non-LTC)
+* $d_{2}$ is the number of COVID-19 deaths in long-term care in Canada. 14805 in this case. In the paper, we know this number for each province.
+* $\eta_j$ is the population level infection fatality rate in group $j$.
+* $\theta_j$ is the COVID-19 death rate (Prob infection x IFR). We can't estimate IFR within LTC because we don't know the number of infections in LTC. This is because we don't have serosurvey data from LTC.
+* $n_{2j}$ is the long-term care population in age group $j$.
+
+For each posterior sample from module 1, we obtain 1 posterior sample from this model. We then estimate age-specific IFR outside of long-term care using $$D^{(t)}_{1j} \sim \text{Bin}(y^{(t)}_{1j}, \eta^{(t)}_j)$$
+
+In the paper, we describe how this is equivalent to sampling from a "cut distribution". This accounts for uncertainty in the number of infections as well as the number of deaths when computing IFR, but does not allow deaths data to inform incidence estimates. We present our estimates of IFR for Canada based on our simulated data in Table \ref{tab:final}. These numbers are presented for demonstration purposes only and are not reflective of actual incidence or IFR in Canada. Please refer to our paper for our estimates of incidence and IFR.
+
+```{r, include = FALSE}
+load("example_deaths.RData")
+```
+
+```{stan, output.var = "module2", include = FALSE}
+// Program for Module 2. 
+// This program is run once for each posterior sample of infections
+// LTC deaths data, total deaths data, and census data and outputs an estimated number of deaths
+// outside LTC for each covariate combination
+data{
+  int<lower =0> M; //number of age groups
+  int deaths_ltc; 
+  int deaths[M]; 
+  int<lower=0> n2[M]; //ltc-pop
+  int infections[M]; // results from poststratification
+}
+
+parameters{
+  real<lower = 0, upper=1> eta[M]; // IFR outside LTC
+  real<lower = 0, upper=1> theta[M]; //COVID-19 death rate within LTC (IFR x prob of infection)
+}
+
+transformed parameters{
+  real<lower=0> lambda1[M];
+  real<lower=0> lambda2[M];
+  
+  for (m in 1:M){
+    lambda1[m] = infections[m]*eta[m];
+    lambda2[m] = n2[m]*theta[m];
+  }
+}
+
+model{
+  
+  for (m in 1:M){
+    deaths[m] ~ poisson(lambda1[m] + lambda2[m]);
+  }
+
+  deaths_ltc ~ poisson(lambda2[1] + lambda2[2] + lambda2[3]+ lambda2[4]);
+
+  // In this example, we use uniform priors on 0,1 (default in stan)
+  // In the paper we use weakly informative priors to deal with small cell counts
+  // eta ~ normal(0.004,0.05);
+  // theta ~normal(0.01,0.1);
+}
+
+generated quantities{
+  int deaths_nonLTC[M];
+  
+  deaths_nonLTC = binomial_rng(infections, eta); 
+  
+}
+
+```
+
+```{r, include = FALSE}
+#load("example_samples.RData")
+
+infections = rstan::extract(example_samples)$infections
+
+module2_data <- list(M=nrow(example_deaths),
+                     deaths_ltc = 14805,# number of deaths in Canada in Long-term care
+                     deaths = example_deaths$deaths_ph2,
+                     n2 = example_deaths$ltc_pop)
+```
+
+
+```{r, cache = TRUE, include = FALSE}
+# for each posterior sample of infections, run module 2 where infections is input data.
+deaths_samples_example <- array(dim = c(4,nrow(infections)))
+for (i in 1:nrow(infections)){
+  module2_data$infections = infections[i,]
+
+  tmp_samples <- sampling(module2, data=module2_data, warmup = 500, iter=700, seed = 12315418)
+
+  deaths_samples_example[,i] <- rstan::extract(tmp_samples)$deaths_nonLTC %>% tail(n=1)
+}
+
+# warnings related to bulk effective sample size can be ignored, since we only need 1 posterior sample
+# for each run.
+```
+
+```{r,include = FALSE}
+# save(deaths_samples_example, file = "deaths_samples_example.RData") 
+```
+
+```{r, include = FALSE}
+#load("deaths_samples_example.RData")
+IFR_samples <- t(deaths_samples_example)/infections
+
+# divide posterior samples of infections over corresponding age group to get estimates of cumulative incidence.
+incidence_samples <- t(infections)/census_age_pops$pop
+
+# estimate overall incidence by aggregating posterior samples over age groups
+overall_incidence <- (100*rowSums(infections)/sum(census_age_pops$pop)) %>%
+  quantile(probs=c(0.025,0.5,0.975)) %>% t() %>% 
+  data.frame() %>% 
+  round(1) %>% 
+  mutate(Incidence = paste0(X50., " (", X2.5., ", ", X97.5., ")" )) %>% 
+  select(Incidence)
+
+# Estimate IFR by aggregating infections over age groups, deaths over age groups, and taking the quotient for each posterior sample
+overall_IFR <- quantile(100*colSums(deaths_samples_example)/(rowSums(infections)), probs = c(0.025,0.5,0.975)) %>% 
+  t() %>% 
+  data.frame() %>% 
+  round(3) %>% 
+  mutate(IFR = paste0(X50., " (", X2.5., ", ", X97.5., ")" )) %>% 
+  select(IFR)
+
+add_row = cbind.data.frame(Age = "Overall", overall_incidence, overall_IFR)
+
+
+incidence_by_age <- (100*incidence_samples) %>% 
+  apply(FUN=quantile, MARGIN=1, probs = c(0.025,0.5,0.975)) %>% 
+  t() %>% 
+  round(2) %>% 
+  data.frame() %>% 
+  mutate(Incidence = paste0(X50., " (", X2.5., ", ", X97.5., ")" )) %>% 
+  select(Incidence)
+  
+
+IFR_by_age <- (100*IFR_samples) %>% 
+  apply(FUN=quantile, MARGIN=2, probs =c(0.025,0.5,0.975)) %>% 
+  t() %>% 
+  round(2) %>% 
+  data.frame() %>% 
+  mutate(IFR = paste0(X50., " (", X2.5., ", ", X97.5., ")" )) %>% 
+  select(IFR)
+
+
+```
+
+
+
+```{r, final, echo = FALSE}
+rbind.data.frame( add_row,
+                  cbind.data.frame(Age = census_age_pops$age_cat, incidence_by_age, IFR_by_age) ) %>% 
+  kable(caption =  "Incidence and IFR for Canadian population based on simulated serosurvey data. Posterior medians and 95\\% credible intervals are presented.") %>%
+  kable_styling(position = "center")
+
+```
+
+
+# Conclusion
+
+In this short example, we demonstrate how incidence and IFR can be computed using the method described in our paper. We present evidence that our method is not particularly sensitive to the informative priors in our mixture models, and that even if these are mis-specified, we can accurately recover both model parameters as well as incidence estimates. We then show how we estimated IFR using the results of the mixture analysis in combination with disaggregated deaths data.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
